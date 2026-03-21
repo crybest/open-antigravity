@@ -199,3 +199,20 @@ export async function cancelCascade(port: number, csrf: string, apiKey: string, 
     body: { cascadeId, metadata: buildMetadata(apiKey) },
   });
 }
+
+export async function proceedArtifact(port: number, csrf: string, apiKey: string, cascadeId: string, artifactUri: string, model?: string) {
+  return grpcCall({
+    port, csrf,
+    method: 'SendUserCascadeMessage',
+    body: {
+      cascadeId,
+      metadata: buildMetadata(apiKey),
+      cascadeConfig: buildCascadeConfig(model),
+      artifactComments: [{
+        artifactUri,
+        fullFile: {},
+        approvalStatus: 'ARTIFACT_APPROVAL_STATUS_APPROVED',
+      }],
+    },
+  });
+}

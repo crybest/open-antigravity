@@ -5,6 +5,11 @@
  * This is the heart of the project — it bridges the gap between
  * Antigravity's async conversation model and the synchronous request-response
  * model of OpenAI/Anthropic APIs.
+ *
+ * Key feature: auto-approval of blocking NOTIFY_USER steps.
+ * When Antigravity creates/modifies files, it may emit a blocking NOTIFY_USER
+ * step that pauses the agent waiting for user approval. This converter
+ * automatically detects and approves these steps so the agent continues.
  */
 
 import { discoverLanguageServers, getLanguageServer } from './bridge/discovery.js';
@@ -46,6 +51,39 @@ function getConnection(workspace?: string) {
 }
 
 /**
+ * Check if a NOTIFY_USER step is blocking and needs auto-approval.
+ * Returns the artifact URI to approve, or null if not blocking.
+ */
+function getBlockingNotifyUri(steps: any[]): string | null {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (!step) continue;
+    const type = step.type || '';
+
+    // If we hit a USER_INPUT after the last NOTIFY_USER, it means
+    // the user already responded — no approval needed
+    if (type === 'CORTEX_STEP_TYPE_USER_INPUT') return null;
+
+    if (type === 'CORTEX_STEP_TYPE_NOTIFY_USER') {
+      const nu = step.notifyUser || {};
+      const blocked = nu.blockedOnUser ?? nu.isBlocking ?? false;
+      if (!blocked) return null;
+
+      // Get the first review path as the artifact URI
+      const paths = nu.pathsToReview || nu.reviewAbsoluteUris || [];
+      if (paths.length > 0) {
+        // paths can be strings or objects with .uri
+        const first = paths[0];
+        return typeof first === 'string' ? first : (first?.uri || first?.absoluteUri || '');
+      }
+      // Blocking but no specific artifact — approve with empty URI
+      return '';
+    }
+  }
+  return null;
+}
+
+/**
  * Send a completion request and wait for the full response (non-streaming).
  */
 export async function complete(req: CompletionRequest): Promise<CompletionResult> {
@@ -79,8 +117,8 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
   // Send the message
   await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cascadeId, promptText, internalModel);
 
-  // Wait for AI response via streaming
-  const content = await waitForResponse(conn.port, conn.csrf, cascadeId, maxWait);
+  // Wait for AI response via streaming (with auto-approval)
+  const content = await waitForResponse(conn.port, conn.csrf, conn.apiKey, cascadeId, internalModel, maxWait);
 
   return {
     conversationId: cascadeId,
@@ -135,17 +173,21 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
   // Send the message
   await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cascadeId, promptText, internalModel);
 
-  // Stream the response
-  yield* streamResponse(conn.port, conn.csrf, cascadeId, maxWait);
+  // Stream the response (with auto-approval)
+  yield* streamResponse(conn.port, conn.csrf, conn.apiKey, cascadeId, internalModel, maxWait);
 }
 
 /**
  * Wait for the AI response by subscribing to StreamAgentStateUpdates.
+ * Auto-approves blocking NOTIFY_USER steps so the agent continues.
  * Returns the full response text when the agent goes idle.
  */
-function waitForResponse(port: number, csrf: string, cascadeId: string, maxWaitMs: number): Promise<string> {
+function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let lastContent = '';
+    let autoApproving = false;  // prevent duplicate approvals
+    const approvedUris = new Set<string>();  // track already approved URIs
+
     const timeout = setTimeout(() => {
       abort();
       resolve(lastContent || '[Timeout: AI did not respond in time]');
@@ -159,7 +201,8 @@ function waitForResponse(port: number, csrf: string, cascadeId: string, maxWaitM
 
         if (stepsUpdate?.steps?.length) {
           const steps = stepsUpdate.steps;
-          // Find the last PLANNER_RESPONSE step
+
+          // Collect latest PLANNER_RESPONSE content
           for (let i = steps.length - 1; i >= 0; i--) {
             const step = steps[i];
             if (step?.plannerResponse) {
@@ -167,13 +210,34 @@ function waitForResponse(port: number, csrf: string, cascadeId: string, maxWaitM
               break;
             }
           }
+
+          // Check for blocking NOTIFY_USER → auto-approve
+          if (!autoApproving) {
+            const blockingUri = getBlockingNotifyUri(steps);
+            if (blockingUri !== null) {
+              const approvalKey = `${steps.length}:${blockingUri}`;
+              if (!approvedUris.has(approvalKey)) {
+                autoApproving = true;
+                approvedUris.add(approvalKey);
+                console.log(`🤖 Auto-approving NOTIFY_USER (uri="${blockingUri || 'none'}")`);
+                grpc.proceedArtifact(port, csrf, apiKey, cascadeId, blockingUri, model)
+                  .then(() => { autoApproving = false; })
+                  .catch(() => { autoApproving = false; });
+              }
+            }
+          }
         }
 
-        // If agent is idle and we have content, we're done
-        if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent) {
-          clearTimeout(timeout);
-          abort();
-          resolve(lastContent);
+        // If agent is idle and we have content, and NOT waiting for approval, we're done
+        if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
+          // Double-check: make sure there's no pending blocking notify
+          const steps = stepsUpdate?.steps || [];
+          const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
+          if (stillBlocking === null) {
+            clearTimeout(timeout);
+            abort();
+            resolve(lastContent);
+          }
         }
       },
       (err) => {
@@ -187,8 +251,9 @@ function waitForResponse(port: number, csrf: string, cascadeId: string, maxWaitM
 
 /**
  * Stream the AI response as chunks.
+ * Auto-approves blocking NOTIFY_USER steps.
  */
-async function* streamResponse(port: number, csrf: string, cascadeId: string, maxWaitMs: number): AsyncGenerator<StreamChunk> {
+async function* streamResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number): AsyncGenerator<StreamChunk> {
   // Use a queue-based approach for async generator + callback bridge
   type QueueItem = StreamChunk | null; // null = done
   const queue: QueueItem[] = [];
@@ -205,6 +270,9 @@ async function* streamResponse(port: number, csrf: string, cascadeId: string, ma
   }
 
   let lastContent = '';
+  let autoApproving = false;
+  const approvedUris = new Set<string>();
+
   const timeout = setTimeout(() => {
     abort();
     push({ type: 'done', conversationId: cascadeId });
@@ -219,6 +287,8 @@ async function* streamResponse(port: number, csrf: string, cascadeId: string, ma
 
       if (stepsUpdate?.steps?.length) {
         const steps = stepsUpdate.steps;
+
+        // Emit content deltas
         for (let i = steps.length - 1; i >= 0; i--) {
           const step = steps[i];
           if (step?.plannerResponse) {
@@ -231,13 +301,34 @@ async function* streamResponse(port: number, csrf: string, cascadeId: string, ma
             break;
           }
         }
+
+        // Auto-approve blocking NOTIFY_USER
+        if (!autoApproving) {
+          const blockingUri = getBlockingNotifyUri(steps);
+          if (blockingUri !== null) {
+            const approvalKey = `${steps.length}:${blockingUri}`;
+            if (!approvedUris.has(approvalKey)) {
+              autoApproving = true;
+              approvedUris.add(approvalKey);
+              console.log(`🤖 Auto-approving NOTIFY_USER (uri="${blockingUri || 'none'}")`);
+              grpc.proceedArtifact(port, csrf, apiKey, cascadeId, blockingUri, model)
+                .then(() => { autoApproving = false; })
+                .catch(() => { autoApproving = false; });
+            }
+          }
+        }
       }
 
-      if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent) {
-        clearTimeout(timeout);
-        abort();
-        push({ type: 'done', conversationId: cascadeId });
-        push(null);
+      // Done: idle + content + not approving + no pending blocks
+      if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
+        const steps = stepsUpdate?.steps || [];
+        const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
+        if (stillBlocking === null) {
+          clearTimeout(timeout);
+          abort();
+          push({ type: 'done', conversationId: cascadeId });
+          push(null);
+        }
       }
     },
     (err) => {
