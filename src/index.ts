@@ -49,7 +49,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return;
   }
 
-  const url = req.url || '';
+  const rawUrl = req.url || '';
+  // Strip query string for route matching
+  const url = rawUrl.split('?')[0];
+
+  // Debug logging for all requests
+  console.log(`📥 ${req.method} ${rawUrl} [${Object.entries(req.headers).filter(([k]) => k.startsWith('x-') || k === 'anthropic-version' || k === 'content-type' || k === 'authorization').map(([k,v]) => `${k}=${v}`).join(', ')}]`);
 
   try {
     // Health check
@@ -85,7 +90,30 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return;
     }
 
+    // Anthropic: POST /v1/messages/count_tokens
+    // Claude Code calls this to validate model availability before sending messages.
+    // Return a stub response with an estimated token count.
+    if (url === '/v1/messages/count_tokens' && req.method === 'POST') {
+      const body = await parseBody(req);
+      const inputTokens = JSON.stringify(body.messages || []).length / 4; // rough estimate
+      console.log(`📊 count_tokens stub: model=${body.model}, estimated=${Math.ceil(inputTokens)}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ input_tokens: Math.ceil(inputTokens) }));
+      return;
+    }
+
+    // Anthropic: POST /v1/messages/batches (stub — not supported but return valid error)
+    if (url.startsWith('/v1/messages/batches') && req.method === 'POST') {
+      res.writeHead(501, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'not_supported', message: 'Batch API is not supported by this proxy.' },
+      }));
+      return;
+    }
+
     // 404
+    console.log(`⚠️  404 Not Found: ${req.method} ${rawUrl}`);
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'Not Found', type: 'not_found' } }));
 
