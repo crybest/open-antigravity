@@ -17,6 +17,22 @@ import { getApiKey } from './bridge/statedb.js';
 import * as grpc from './bridge/grpc.js';
 import { resolveModelId } from './models.js';
 
+/**
+ * Extract text from Anthropic message content (handles both string and array formats).
+ * Claude Code sends: [{type: 'text', text: '...'}, {type: 'tool_use', ...}]
+ * Simple clients send: 'plain string'
+ */
+function extractText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block: any) => block.type === 'text')
+      .map((block: any) => block.text || '')
+      .join('\n');
+  }
+  return String(content || '');
+}
+
 export interface CompletionRequest {
   messages: Array<{ role: string; content: string }>;
   model?: string;
@@ -98,7 +114,7 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
   const lastUserMsg = userMessages.filter(m => m.role === 'user').pop();
   if (!lastUserMsg) throw new Error('No user message found in messages array');
 
-  let promptText = lastUserMsg.content;
+  let promptText = extractText(lastUserMsg.content);
   if (req.system) {
     promptText = `[System: ${req.system}]\n\n${promptText}`;
   }
@@ -149,7 +165,7 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
     return;
   }
 
-  let promptText = lastUserMsg.content;
+  let promptText = extractText(lastUserMsg.content);
   if (req.system) {
     promptText = `[System: ${req.system}]\n\n${promptText}`;
   }
