@@ -33,18 +33,26 @@ export function resolveModelId(externalName?: string): string {
   // Direct internal ID pass-through
   if (externalName.startsWith('MODEL_')) return externalName;
 
-  // Try exact match
+  const name = externalName.toLowerCase();
+
+  // Exact match first
   const exact = MODEL_MAP.find(m => m.id === externalName);
   if (exact) return exact.internalId;
 
-  // Fuzzy match (contains)
-  const fuzzy = MODEL_MAP.find(m =>
-    externalName.toLowerCase().includes(m.id.toLowerCase()) ||
-    m.id.toLowerCase().includes(externalName.toLowerCase())
-  );
-  if (fuzzy) return fuzzy.internalId;
+  // Family-based matching — handles any version suffix (e.g. claude-opus-4-6, claude-opus-4-20250514)
+  if (name.includes('opus'))   return 'MODEL_PLACEHOLDER_M26'; // Claude Opus
+  if (name.includes('sonnet')) return 'MODEL_PLACEHOLDER_M35'; // Claude Sonnet
+  if (name.includes('haiku'))  return 'MODEL_PLACEHOLDER_M35'; // No Haiku → fall back to Sonnet
+  if (name.includes('claude')) return 'MODEL_PLACEHOLDER_M35'; // Any other Claude → Sonnet
 
-  // Pass through as-is (might be a new model)
+  if (name.includes('gemini-3.1') || name.includes('gemini-pro')) return 'MODEL_PLACEHOLDER_M37';
+  if (name.includes('gemini-3-flash') || name.includes('gemini-flash')) return 'MODEL_PLACEHOLDER_M47';
+  if (name.includes('gemini')) return 'MODEL_PLACEHOLDER_M37'; // Any other Gemini → Pro High
+
+  if (name.includes('gpt')) return 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM';
+
+  // Pass through as-is (might be a new internal ID)
+  console.log(`⚠️  Unknown model "${externalName}", passing through as-is`);
   return externalName;
 }
 

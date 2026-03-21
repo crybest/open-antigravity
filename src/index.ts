@@ -86,6 +86,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     // Anthropic: POST /v1/messages
     if (url === '/v1/messages' && req.method === 'POST') {
       const body = await parseBody(req);
+      console.log(`  ↳ model=${body.model} max_tokens=${body.max_tokens} stream=${body.stream} msgs=${body.messages?.length} tools=${body.tools?.length ?? 0} sysLen=${typeof body.system === 'string' ? body.system.length : 0}`);
       await handleMessages(req, res, body);
       return;
     }

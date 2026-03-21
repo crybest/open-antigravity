@@ -33,6 +33,46 @@ function extractText(content: any): string {
   return String(content || '');
 }
 
+/**
+ * Extract text from system prompt (string or Anthropic content block array).
+ */
+function extractSystemText(system: any): string | undefined {
+  if (!system) return undefined;
+  if (typeof system === 'string') return system || undefined;
+  if (Array.isArray(system)) {
+    const text = system
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text || '')
+      .join('\n');
+    return text || undefined;
+  }
+  return undefined;
+}
+
+/** Debug logging — set DEBUG=1 to enable. */
+const DEBUG = !!process.env.DEBUG;
+function dbg(...args: any[]) { if (DEBUG) console.log('[DBG]', ...args); }
+
+/**
+ * Extract the latest AI response text from a step list.
+ * Tries several known Antigravity response field names.
+ */
+function extractContent(steps: any[]): string {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (!step) continue;
+    const pr = step.plannerResponse;
+    if (pr) {
+      const text = pr.modifiedResponse || pr.response || pr.text || pr.content || '';
+      if (text) return text;
+    }
+    // Some agentic steps embed the response directly
+    const text = step.response || step.text || step.content || '';
+    if (text && typeof text === 'string') return text;
+  }
+  return '';
+}
+
 export interface CompletionRequest {
   messages: Array<{ role: string; content: string }>;
   model?: string;
@@ -108,6 +148,7 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
 
   const internalModel = resolveModelId(req.model);
   const maxWait = req.maxWaitMs || 120_000;
+  console.log(`🧠 complete: model=${req.model} → ${internalModel} maxWait=${maxWait}ms`);
 
   // Build the message text (prepend system prompt if present)
   const userMessages = req.messages.filter(m => m.role === 'user' || m.role === 'assistant');
@@ -116,7 +157,8 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
 
   let promptText = extractText(lastUserMsg.content);
   if (req.system) {
-    promptText = `[System: ${req.system}]\n\n${promptText}`;
+    const sysText = extractSystemText(req.system);
+    if (sysText) promptText = `[System: ${sysText}]\n\n${promptText}`;
   }
 
   // Create or reuse conversation
@@ -167,7 +209,8 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
 
   let promptText = extractText(lastUserMsg.content);
   if (req.system) {
-    promptText = `[System: ${req.system}]\n\n${promptText}`;
+    const sysText = extractSystemText(req.system);
+    if (sysText) promptText = `[System: ${sysText}]\n\n${promptText}`;
   }
 
   // Create or reuse conversation
@@ -201,33 +244,39 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
 function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let lastContent = '';
-    let autoApproving = false;  // prevent duplicate approvals
-    const approvedUris = new Set<string>();  // track already approved URIs
+    let updateCount = 0;
+    let autoApproving = false;
+    const approvedUris = new Set<string>();
 
     const timeout = setTimeout(() => {
       abort();
+      console.log(`⏱ waitForResponse timeout after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars`);
       resolve(lastContent || '[Timeout: AI did not respond in time]');
     }, maxWaitMs);
 
     const abort = grpc.streamAgentState(
       port, csrf, cascadeId,
       (update) => {
+        updateCount++;
         const status = update?.status || '';
         const stepsUpdate = update?.mainTrajectoryUpdate?.stepsUpdate;
+        const steps: any[] = stepsUpdate?.steps || [];
 
-        if (stepsUpdate?.steps?.length) {
-          const steps = stepsUpdate.steps;
+        // Always log first update and status transitions
+        if (updateCount === 1 || status.includes('IDLE') || status.includes('ERROR')) {
+          const last = steps[steps.length - 1];
+          console.log(`📡 wait #${updateCount} cascadeId=${cascadeId.slice(0,8)} status=${status} steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+        }
+        dbg(`update#${updateCount} status=${status} steps=${steps.length}`);
+        if (DEBUG && steps.length) {
+          const last = steps[steps.length - 1];
+          dbg(`  last step type=${last?.type} hasPR=${!!last?.plannerResponse} keys=${Object.keys(last || {}).join(',')}`);
+        }
 
-          // Collect latest PLANNER_RESPONSE content
-          for (let i = steps.length - 1; i >= 0; i--) {
-            const step = steps[i];
-            if (step?.plannerResponse) {
-              lastContent = step.plannerResponse.modifiedResponse || step.plannerResponse.response || '';
-              break;
-            }
-          }
+        if (steps.length) {
+          const content = extractContent(steps);
+          if (content) lastContent = content;
 
-          // Check for blocking NOTIFY_USER → auto-approve
           if (!autoApproving) {
             const blockingUri = getBlockingNotifyUri(steps);
             if (blockingUri !== null) {
@@ -244,20 +293,19 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
           }
         }
 
-        // If agent is idle and we have content, and NOT waiting for approval, we're done
         if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
-          // Double-check: make sure there's no pending blocking notify
-          const steps = stepsUpdate?.steps || [];
           const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
           if (stillBlocking === null) {
             clearTimeout(timeout);
             abort();
+            dbg(`resolved after ${updateCount} updates`);
             resolve(lastContent);
           }
         }
       },
       (err) => {
         clearTimeout(timeout);
+        console.log(`❌ streamAgentState error after ${updateCount} updates: ${err.message}`);
         if (lastContent) resolve(lastContent);
         else reject(new Error(`Stream error: ${err.message}`));
       }
@@ -270,8 +318,7 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
  * Auto-approves blocking NOTIFY_USER steps.
  */
 async function* streamResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number): AsyncGenerator<StreamChunk> {
-  // Use a queue-based approach for async generator + callback bridge
-  type QueueItem = StreamChunk | null; // null = done
+  type QueueItem = StreamChunk | null;
   const queue: QueueItem[] = [];
   let resolve: (() => void) | null = null;
 
@@ -286,11 +333,13 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
   }
 
   let lastContent = '';
+  let updateCount = 0;
   let autoApproving = false;
   const approvedUris = new Set<string>();
 
   const timeout = setTimeout(() => {
     abort();
+    console.log(`⏱ streamResponse timeout after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars`);
     push({ type: 'done', conversationId: cascadeId });
     push(null);
   }, maxWaitMs);
@@ -298,27 +347,30 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
   const abort = grpc.streamAgentState(
     port, csrf, cascadeId,
     (update) => {
+      updateCount++;
       const status = update?.status || '';
       const stepsUpdate = update?.mainTrajectoryUpdate?.stepsUpdate;
+      const steps: any[] = stepsUpdate?.steps || [];
 
-      if (stepsUpdate?.steps?.length) {
-        const steps = stepsUpdate.steps;
+      // Always log first update and status transitions so we can diagnose hangs
+      if (updateCount === 1 || status.includes('IDLE') || status.includes('ERROR')) {
+        const last = steps[steps.length - 1];
+        console.log(`📡 stream #${updateCount} cascadeId=${cascadeId.slice(0,8)} status=${status} steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+      }
+      dbg(`stream update#${updateCount} status=${status} steps=${steps.length}`);
+      if (DEBUG && steps.length) {
+        const last = steps[steps.length - 1];
+        dbg(`  last step type=${last?.type} hasPR=${!!last?.plannerResponse} keys=${Object.keys(last || {}).join(',')}`);
+      }
 
-        // Emit content deltas
-        for (let i = steps.length - 1; i >= 0; i--) {
-          const step = steps[i];
-          if (step?.plannerResponse) {
-            const newContent = step.plannerResponse.modifiedResponse || step.plannerResponse.response || '';
-            if (newContent.length > lastContent.length) {
-              const delta = newContent.slice(lastContent.length);
-              lastContent = newContent;
-              push({ type: 'content_delta', text: delta, conversationId: cascadeId });
-            }
-            break;
-          }
+      if (steps.length) {
+        const newContent = extractContent(steps);
+        if (newContent.length > lastContent.length) {
+          const delta = newContent.slice(lastContent.length);
+          lastContent = newContent;
+          push({ type: 'content_delta', text: delta, conversationId: cascadeId });
         }
 
-        // Auto-approve blocking NOTIFY_USER
         if (!autoApproving) {
           const blockingUri = getBlockingNotifyUri(steps);
           if (blockingUri !== null) {
@@ -335,13 +387,12 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
         }
       }
 
-      // Done: idle + content + not approving + no pending blocks
       if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
-        const steps = stepsUpdate?.steps || [];
         const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
         if (stillBlocking === null) {
           clearTimeout(timeout);
           abort();
+          dbg(`stream resolved after ${updateCount} updates`);
           push({ type: 'done', conversationId: cascadeId });
           push(null);
         }
@@ -349,12 +400,12 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
     },
     (err) => {
       clearTimeout(timeout);
+      console.log(`❌ streamAgentState error after ${updateCount} updates: ${err.message}`);
       push({ type: 'error', error: err.message });
       push(null);
     }
   );
 
-  // Yield from queue
   while (true) {
     await waitForItem();
     const item = queue.shift();
