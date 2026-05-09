@@ -2,10 +2,17 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import path from 'path';
 
-const STATE_DB_PATH = path.join(
-  homedir(),
-  'Library/Application Support/Antigravity/User/globalStorage/state.vscdb'
-);
+function getStateDbPath() {
+  if (process.platform === 'win32') {
+    return path.join(process.env.APPDATA || path.join(homedir(), 'AppData', 'Roaming'), 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+  } else if (process.platform === 'darwin') {
+    return path.join(homedir(), 'Library', 'Application Support', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+  } else {
+    return path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), '.config'), 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+  }
+}
+
+const STATE_DB_PATH = getStateDbPath();
 
 function queryDb(sql: string): string {
   try {

@@ -11,8 +11,9 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { handleChatCompletions, handleModels } from './routes/openai.js';
 import { handleMessages } from './routes/anthropic.js';
-import { discoverLanguageServers } from './bridge/discovery.js';
+import { discoverLanguageServers, getLanguageServer } from './bridge/discovery.js';
 import { getApiKey } from './bridge/statedb.js';
+import { getModelConfigs } from './bridge/grpc.js';
 
 const PORT = parseInt(process.env.PORT || '4000');
 const HOST = process.env.HOST || '0.0.0.0';
@@ -67,6 +68,23 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         servers: servers.length,
         hasApiKey: !!apiKey,
       }));
+      return;
+    }
+
+    // Debug: dump raw model config data from Antigravity language_server.
+    // Use this to discover the latest MODEL_PLACEHOLDER_* IDs for this account/version.
+    if (url === '/debug/model-configs' && req.method === 'GET') {
+      const srv = getLanguageServer();
+      const apiKey = getApiKey();
+      if (!srv || !apiKey) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No Antigravity language_server or API key found' }));
+        return;
+      }
+
+      const configs = await getModelConfigs(srv.port, srv.csrf, apiKey);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(configs, null, 2));
       return;
     }
 
@@ -152,7 +170,7 @@ server.listen(PORT, HOST, () => {
     console.log('⚠️  No Antigravity language_server found. Is Antigravity running?');
   } else {
     console.log(`✅ Found ${servers.length} server(s):`);
-    servers.forEach(s => console.log(`   port=${s.port}  workspace="${s.workspace}"`));
+    servers.forEach(s => console.log(`   port=${s.port}  workspace="${s.workspace ?? '<no-workspace>'}"`));
   }
   if (!apiKey) {
     console.log('⚠️  No API key found in state.vscdb');

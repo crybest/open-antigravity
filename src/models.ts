@@ -13,7 +13,7 @@ const MODEL_MAP: ModelMapping[] = [
   // Gemini models
   { id: 'gemini-3.1-pro',       internalId: 'MODEL_PLACEHOLDER_M37', displayName: 'Gemini 3.1 Pro (High)',  provider: 'google' },
   { id: 'gemini-3.1-pro-low',   internalId: 'MODEL_PLACEHOLDER_M36', displayName: 'Gemini 3.1 Pro (Low)',   provider: 'google' },
-  { id: 'gemini-3-flash',       internalId: 'MODEL_PLACEHOLDER_M47', displayName: 'Gemini 3 Flash',         provider: 'google' },
+  { id: 'gemini-3-flash',       internalId: 'MODEL_PLACEHOLDER_M84', displayName: 'Gemini 3 Flash',         provider: 'google' },
 
   // Claude models
   { id: 'claude-sonnet-4-20250514',     internalId: 'MODEL_PLACEHOLDER_M35', displayName: 'Claude Sonnet 4.6 (Thinking)',  provider: 'anthropic' },
@@ -46,7 +46,7 @@ export function resolveModelId(externalName?: string): string {
   if (name.includes('claude')) return 'MODEL_PLACEHOLDER_M35'; // Any other Claude → Sonnet
 
   if (name.includes('gemini-3.1') || name.includes('gemini-pro')) return 'MODEL_PLACEHOLDER_M37';
-  if (name.includes('gemini-3-flash') || name.includes('gemini-flash')) return 'MODEL_PLACEHOLDER_M47';
+  if (name.includes('gemini-3-flash') || name.includes('gemini-flash')) return 'MODEL_PLACEHOLDER_M84';
   if (name.includes('gemini')) return 'MODEL_PLACEHOLDER_M37'; // Any other Gemini → Pro High
 
   if (name.includes('gpt')) return 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM';

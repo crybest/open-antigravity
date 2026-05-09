@@ -94,7 +94,7 @@ print(msg.content[0].text)
 |----------|---------------------|----------|
 | `gemini-3.1-pro` | MODEL_PLACEHOLDER_M37 | Gemini 3.1 Pro (High) |
 | `gemini-3.1-pro-low` | MODEL_PLACEHOLDER_M36 | Gemini 3.1 Pro (Low) |
-| `gemini-3-flash` | MODEL_PLACEHOLDER_M47 | Gemini 3 Flash |
+| `gemini-3-flash` | MODEL_PLACEHOLDER_M84 | Gemini 3 Flash |
 | `claude-sonnet-4-20250514` | MODEL_PLACEHOLDER_M35 | Claude Sonnet 4.6 (Thinking) |
 | `claude-opus-4-20250514` | MODEL_PLACEHOLDER_M26 | Claude Opus 4.6 (Thinking) |
 | `gpt-oss-120b` | MODEL_OPENAI_GPT_OSS_120B_MEDIUM | GPT-OSS 120B |

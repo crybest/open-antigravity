@@ -39,12 +39,24 @@ export interface GrpcCallOptions {
   body: Record<string, any>;
 }
 
+/** Methods whose request/response should be dumped for debugging */
+const VERBOSE_METHODS = new Set(['StartCascade', 'SendUserCascadeMessage', 'AddTrackedWorkspace', 'UpdateConversationAnnotations']);
+
+function truncate(s: string, n = 2000): string {
+  return s.length > n ? s.slice(0, n) + `…(+${s.length - n} bytes)` : s;
+}
+
 /**
  * Make a gRPC-Web call to the language_server.
  */
 export function grpcCall(opts: GrpcCallOptions): Promise<any> {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(opts.body);
+    const verbose = VERBOSE_METHODS.has(opts.method);
+    const t0 = Date.now();
+    if (verbose) {
+      console.log(`📤 ${opts.method} req=${truncate(payload)}`);
+    }
     const req = https.request({
       hostname: '127.0.0.1',
       port: opts.port,
@@ -61,11 +73,18 @@ export function grpcCall(opts: GrpcCallOptions): Promise<any> {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
+        const dt = Date.now() - t0;
+        if (verbose) {
+          console.log(`📥 ${opts.method} status=${res.statusCode} (${dt}ms) resp=${truncate(data)}`);
+        }
         try { resolve(JSON.parse(data)); }
         catch { resolve(data); }
       });
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      if (verbose) console.log(`❌ ${opts.method} req error: ${err.message}`);
+      reject(err);
+    });
     req.write(payload);
     req.end();
   });
@@ -144,7 +163,10 @@ export function buildCascadeConfig(model: string = 'MODEL_PLACEHOLDER_M26') {
       conversational: { plannerMode: 'CONVERSATIONAL_PLANNER_MODE_DEFAULT', agenticMode: true },
       toolConfig: {
         runCommand: { autoCommandConfig: { autoExecutionPolicy: 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER' } },
-        notifyUser: { artifactReviewMode: 'ARTIFACT_REVIEW_MODE_ALWAYS' },
+        notifyUser: { artifactReviewMode: 'ARTIFACT_REVIEW_MODE_AUTO' },
+        code: { allowEditGitignore: true },
+        viewFile: { allowViewGitignore: true },
+        grep: { allowAccessGitignore: true },
       },
       requestedModel: { model },
     },
@@ -181,6 +203,23 @@ export async function addTrackedWorkspace(port: number, csrf: string, workspaceP
     port, csrf,
     method: 'AddTrackedWorkspace',
     body: { workspace: workspacePath },
+  });
+}
+
+/**
+ * Mark a conversation as "viewed by user" so the language_server doesn't
+ * filter out our updates as a "ghost conversation". Required between
+ * StartCascade and SendUserCascadeMessage to make the executor actually run.
+ */
+export async function updateConversationAnnotations(port: number, csrf: string, apiKey: string, cascadeId: string) {
+  return grpcCall({
+    port, csrf,
+    method: 'UpdateConversationAnnotations',
+    body: {
+      cascadeId,
+      annotations: { lastUserViewTime: new Date().toISOString() },
+      metadata: buildMetadata(apiKey),
+    },
   });
 }
 

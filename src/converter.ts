@@ -16,6 +16,7 @@ import { discoverLanguageServers, getLanguageServer } from './bridge/discovery.j
 import { getApiKey } from './bridge/statedb.js';
 import * as grpc from './bridge/grpc.js';
 import { resolveModelId } from './models.js';
+import { existsSync } from 'fs';
 
 /**
  * Extract text from Anthropic message content (handles both string and array formats).
@@ -54,23 +55,137 @@ const DEBUG = !!process.env.DEBUG;
 function dbg(...args: any[]) { if (DEBUG) console.log('[DBG]', ...args); }
 
 /**
+ * Convert a file:// URI to an OS-native path Antigravity will accept.
+ * Windows: `file:///D:/foo` → `D:/foo` (strip leading slash before drive letter).
+ * Unix:    `file:///home/x` → `/home/x`.
+ */
+function fileUriToPath(uri: string): string {
+  let p = uri.replace(/^file:\/\//, '');
+  if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) {
+    p = p.slice(1);
+  }
+  return p;
+}
+
+const RESPONSE_TEXT_KEYS = [
+  'modifiedResponse',
+  'response',
+  'text',
+  'content',
+  'markdown',
+  'message',
+  'output',
+  'answer',
+  'finalResponse',
+  'responseText',
+  'displayText',
+];
+
+const RESPONSE_CONTAINER_KEYS = [
+  'parts',
+  'chunks',
+  'segments',
+  'blocks',
+  'items',
+  'responseParts',
+  'contentParts',
+];
+
+function extractTextValue(value: any, depth = 0): string {
+  if (value == null || depth > 6) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value !== 'object') return '';
+
+  if (Array.isArray(value)) {
+    return value.map(item => extractTextValue(item, depth + 1)).filter(Boolean).join('');
+  }
+
+  for (const key of RESPONSE_TEXT_KEYS) {
+    const text = extractTextValue(value[key], depth + 1);
+    if (text) return text;
+  }
+
+  for (const key of RESPONSE_CONTAINER_KEYS) {
+    const text = extractTextValue(value[key], depth + 1);
+    if (text) return text;
+  }
+
+  return '';
+}
+
+function extractStepContent(step: any): string {
+  if (!step) return '';
+  if (step.plannerResponse) {
+    const text = extractTextValue(step.plannerResponse);
+    if (text) return text;
+  }
+
+  // Some agentic steps embed the user-visible response directly on the step.
+  return extractTextValue({
+    response: step.response,
+    text: step.text,
+    content: step.content,
+    markdown: step.markdown,
+  });
+}
+
+/**
  * Extract the latest AI response text from a step list.
- * Tries several known Antigravity response field names.
+ * Antigravity has moved planner text across nested fields over versions, so
+ * this accepts both direct strings and nested text/content/parts containers.
  */
 function extractContent(steps: any[]): string {
   for (let i = steps.length - 1; i >= 0; i--) {
-    const step = steps[i];
-    if (!step) continue;
-    const pr = step.plannerResponse;
-    if (pr) {
-      const text = pr.modifiedResponse || pr.response || pr.text || pr.content || '';
-      if (text) return text;
-    }
-    // Some agentic steps embed the response directly
-    const text = step.response || step.text || step.content || '';
-    if (text && typeof text === 'string') return text;
+    const text = extractStepContent(steps[i]);
+    if (text) return text;
   }
   return '';
+}
+
+function getRequestedInteraction(step: any): any {
+  return step?.requestedInteraction
+    || step?.codeAction?.requestedInteraction
+    || step?.filePermissionRequest
+    || step?.codeAction?.filePermissionRequest
+    || null;
+}
+
+function hasRequestedInteraction(steps: any[]): boolean {
+  return steps.some(step => !!getRequestedInteraction(step));
+}
+
+function hasDonePlannerResponse(steps: any[]): boolean {
+  return steps.some(step =>
+    step?.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE'
+    && step?.status === 'CORTEX_STEP_STATUS_DONE'
+    && !!extractStepContent(step)
+  );
+}
+
+function logStepShapeDiagnostics(steps: any[], prefix: string, seen: Set<string>) {
+  for (const step of steps) {
+    if (!step) continue;
+
+    if (step.plannerResponse) {
+      const keys = Object.keys(step.plannerResponse).join(',');
+      const key = `planner:${keys}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const text = extractStepContent(step);
+        console.log(`${prefix} plannerResponse status=${step.status || '-'} keys=${keys || '-'} textLen=${text.length} sample=${JSON.stringify(text.slice(0, 240))}`);
+      }
+    }
+
+    const interaction = getRequestedInteraction(step);
+    if (interaction) {
+      const keys = Object.keys(interaction).join(',');
+      const key = `interaction:${step.type || '?'}:${keys}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        console.log(`${prefix} requestedInteraction stepType=${step.type || '-'} stepStatus=${step.status || '-'} keys=${keys || '-'} body=${JSON.stringify(interaction).slice(0, 1200)}`);
+      }
+    }
+  }
 }
 
 export interface CompletionRequest {
@@ -98,12 +213,49 @@ export interface StreamChunk {
 
 /**
  * Get a server connection for the given workspace.
+ *
+ * The cascade gRPC API is served by the global (no-workspace) language_server.
+ * Workspace context is passed in `workspaceUris` on each call. We pick a real
+ * workspace path either from the caller hint or by borrowing one from any
+ * discovered per-workspace language_server. If that path is stale (folder no
+ * longer exists), fall back to process.cwd().
  */
 function getConnection(workspace?: string) {
+  const t0 = Date.now();
   const srv = workspace ? getLanguageServer(workspace) : getLanguageServer();
+  const tDisc = Date.now();
   const apiKey = getApiKey();
+  const tKey = Date.now();
+  console.log(`⏱ getConnection: discover=${tDisc - t0}ms getApiKey=${tKey - tDisc}ms (total ${tKey - t0}ms)`);
   if (!srv || !apiKey) return null;
-  return { ...srv, apiKey };
+
+  // Resolve workspace URI: explicit hint > server's own workspace > borrow from any per-workspace server.
+  let workspaceUri: string | undefined = workspace || srv.workspace;
+  if (!workspaceUri) {
+    const all = discoverLanguageServers();
+    workspaceUri = all.find(s => !!s.workspace)?.workspace;
+  }
+
+  // Validate the chosen workspace actually exists on disk; if not, fall back to cwd.
+  // Antigravity rejects AddTrackedWorkspace with 500 if the path is missing,
+  // and the executor will silently bail right after USER_INPUT.
+  if (workspaceUri) {
+    const path = fileUriToPath(workspaceUri);
+    if (!existsSync(path)) {
+      const fallback = process.cwd().replace(/\\/g, '/');
+      const fallbackUri = process.platform === 'win32'
+        ? `file:///${fallback}`
+        : `file://${fallback}`;
+      console.log(`⚠️  workspace "${path}" does not exist — falling back to cwd "${fallback}"`);
+      workspaceUri = fallbackUri;
+    }
+  } else {
+    const fallback = process.cwd().replace(/\\/g, '/');
+    workspaceUri = process.platform === 'win32' ? `file:///${fallback}` : `file://${fallback}`;
+    console.log(`ℹ️  no workspace from discovery — using cwd "${fallback}"`);
+  }
+
+  return { ...srv, apiKey, workspace: workspaceUri };
 }
 
 /**
@@ -163,20 +315,40 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
 
   // Create or reuse conversation
   let cascadeId = req.conversationId;
+  const tCascadeStart = Date.now();
   if (!cascadeId) {
     const wsUri = conn.workspace || 'file:///tmp/antigravity-playground';
-    const wsPath = wsUri.replace(/^file:\/\//, '');
+    const wsPath = fileUriToPath(wsUri);
+    const tA = Date.now();
     await grpc.addTrackedWorkspace(conn.port, conn.csrf, wsPath);
+    const tB = Date.now();
     const cascade = await grpc.startCascade(conn.port, conn.csrf, conn.apiKey, wsUri);
+    const tC = Date.now();
     cascadeId = cascade.cascadeId;
     if (!cascadeId) throw new Error('Failed to create conversation');
+    // Required between StartCascade and SendUserCascadeMessage so the executor actually runs.
+    await grpc.updateConversationAnnotations(conn.port, conn.csrf, conn.apiKey, cascadeId);
+    const tD = Date.now();
+    console.log(`⏱ new cascade: addTrackedWorkspace=${tB - tA}ms startCascade=${tC - tB}ms updateAnnotations=${tD - tC}ms`);
+  } else {
+    console.log(`♻️  reusing cascade=${cascadeId.slice(0,8)}`);
   }
 
-  // Send the message
-  await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cascadeId, promptText, internalModel);
+  // IMPORTANT: subscribe to state updates BEFORE sending the message.
+  // The Antigravity language_server starts the executor only when there's an
+  // active subscriber listening to the cascade. If we send first and subscribe
+  // after, the executor stays in IDLE forever.
+  const tWaitStart = Date.now();
+  const responsePromise = waitForResponse(conn.port, conn.csrf, conn.apiKey, cascadeId, internalModel, maxWait);
 
-  // Wait for AI response via streaming (with auto-approval)
-  const content = await waitForResponse(conn.port, conn.csrf, conn.apiKey, cascadeId, internalModel, maxWait);
+  // Now send the message (the trigger).
+  const tSendStart = Date.now();
+  await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cascadeId, promptText, internalModel);
+  const tSendDone = Date.now();
+  console.log(`⏱ sendMessage=${tSendDone - tSendStart}ms promptLen=${promptText.length}chars cascadePhase=${tSendDone - tCascadeStart}ms`);
+
+  const content = await responsePromise;
+  console.log(`⏱ waitForResponse total=${Date.now() - tWaitStart}ms contentLen=${content.length}`);
 
   return {
     conversationId: cascadeId,
@@ -215,25 +387,39 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
 
   // Create or reuse conversation
   let cascadeId = req.conversationId;
+  const tCascadeStart = Date.now();
   if (!cascadeId) {
     const wsUri = conn.workspace || 'file:///tmp/antigravity-playground';
-    const wsPath = wsUri.replace(/^file:\/\//, '');
+    const wsPath = fileUriToPath(wsUri);
+    const tA = Date.now();
     await grpc.addTrackedWorkspace(conn.port, conn.csrf, wsPath);
+    const tB = Date.now();
     const cascade = await grpc.startCascade(conn.port, conn.csrf, conn.apiKey, wsUri);
+    const tC = Date.now();
     cascadeId = cascade.cascadeId;
     if (!cascadeId) {
       yield { type: 'error', error: 'Failed to create conversation' };
       return;
     }
+    await grpc.updateConversationAnnotations(conn.port, conn.csrf, conn.apiKey, cascadeId);
+    const tD = Date.now();
+    console.log(`⏱ [stream] new cascade: addTrackedWorkspace=${tB - tA}ms startCascade=${tC - tB}ms updateAnnotations=${tD - tC}ms`);
+  } else {
+    console.log(`♻️  [stream] reusing cascade=${cascadeId.slice(0,8)}`);
   }
 
   yield { type: 'content_delta', text: '', conversationId: cascadeId };
 
-  // Send the message
-  await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cascadeId, promptText, internalModel);
-
-  // Stream the response (with auto-approval)
-  yield* streamResponse(conn.port, conn.csrf, conn.apiKey, cascadeId, internalModel, maxWait);
+  // Stream the response. streamResponse subscribes first, THEN calls the
+  // trigger to send the user message — this is required so the executor runs.
+  const cId = cascadeId;
+  const tCascadeStartCaptured = tCascadeStart;
+  yield* streamResponse(conn.port, conn.csrf, conn.apiKey, cId, internalModel, maxWait, async () => {
+    const tSendStart = Date.now();
+    await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, cId, promptText, internalModel);
+    const tSendDone = Date.now();
+    console.log(`⏱ [stream] sendMessage=${tSendDone - tSendStart}ms promptLen=${promptText.length}chars cascadePhase=${tSendDone - tCascadeStartCaptured}ms`);
+  });
 }
 
 /**
@@ -248,12 +434,24 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
     let autoApproving = false;
     const approvedUris = new Set<string>();
 
+    // Diagnostics
+    const tStart = Date.now();
+    let tFirstUpdate = 0;
+    let tFirstContent = 0;
+    const seenStepTypes: string[] = [];
+    const stepTypeCount = new Map<string, number>();
+
     const timeout = setTimeout(() => {
       abort();
-      console.log(`⏱ waitForResponse timeout after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars`);
+      console.log(`⏱ waitForResponse TIMEOUT after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars`);
+      console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ') || '(none)'}`);
+      console.log(`   sequence: ${seenStepTypes.join(' → ')}`);
       resolve(lastContent || '[Timeout: AI did not respond in time]');
     }, maxWaitMs);
 
+    let lastStatus = '';
+    let firstUpdateDumped = false;
+    const shapeDiagnosticsSeen = new Set<string>();
     const abort = grpc.streamAgentState(
       port, csrf, cascadeId,
       (update) => {
@@ -262,10 +460,32 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
         const stepsUpdate = update?.mainTrajectoryUpdate?.stepsUpdate;
         const steps: any[] = stepsUpdate?.steps || [];
 
-        // Always log first update and status transitions
-        if (updateCount === 1 || status.includes('IDLE') || status.includes('ERROR')) {
+        if (updateCount === 1) {
+          tFirstUpdate = Date.now();
+          console.log(`⏱ first update arrived after ${tFirstUpdate - tStart}ms`);
+        }
+        if (!firstUpdateDumped) {
+          firstUpdateDumped = true;
+          console.log(`🔎 first update keys=${Object.keys(update || {}).join(',')} body=${JSON.stringify(update).slice(0, 1500)}`);
+        }
+
+        // Track step type sequence — log when a NEW type appears
+        if (steps.length) {
           const last = steps[steps.length - 1];
-          console.log(`📡 wait #${updateCount} cascadeId=${cascadeId.slice(0,8)} status=${status} steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+          const t = last?.type || '?';
+          const prevLast = seenStepTypes[seenStepTypes.length - 1];
+          if (t !== prevLast) {
+            seenStepTypes.push(t);
+            console.log(`🔸 step #${steps.length} type=${t} (Δ${Date.now() - tStart}ms) hasPR=${!!last?.plannerResponse}`);
+          }
+          stepTypeCount.set(t, (stepTypeCount.get(t) || 0) + 1);
+        }
+
+        // Log EVERY status transition (not just IDLE/ERROR) so we can see if the agent ever runs.
+        if (status !== lastStatus) {
+          const last = steps[steps.length - 1];
+          console.log(`📡 wait #${updateCount} status=${lastStatus || '∅'} → ${status} (Δ${Date.now() - tStart}ms) steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+          lastStatus = status;
         }
         dbg(`update#${updateCount} status=${status} steps=${steps.length}`);
         if (DEBUG && steps.length) {
@@ -274,8 +494,16 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
         }
 
         if (steps.length) {
+          logStepShapeDiagnostics(steps, '🔬', shapeDiagnosticsSeen);
+
           const content = extractContent(steps);
-          if (content) lastContent = content;
+          if (content) {
+            if (!tFirstContent) {
+              tFirstContent = Date.now();
+              console.log(`⏱ first content arrived after ${tFirstContent - tStart}ms (${content.length}chars)`);
+            }
+            lastContent = content;
+          }
 
           if (!autoApproving) {
             const blockingUri = getBlockingNotifyUri(steps);
@@ -293,19 +521,25 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
           }
         }
 
-        if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
+        if (lastContent && !autoApproving && (status === 'CASCADE_RUN_STATUS_IDLE' || hasRequestedInteraction(steps))) {
           const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
           if (stillBlocking === null) {
             clearTimeout(timeout);
             abort();
-            dbg(`resolved after ${updateCount} updates`);
+            const tEnd = Date.now();
+            console.log(`✅ wait DONE after ${tEnd - tStart}ms status=${status || '-'} donePlanner=${hasDonePlannerResponse(steps)} requestedInteraction=${hasRequestedInteraction(steps)} (firstUpdate=${tFirstUpdate - tStart}ms firstContent=${tFirstContent ? tFirstContent - tStart : -1}ms updates=${updateCount} steps=${steps.length})`);
+            console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ')}`);
+            console.log(`   sequence: ${seenStepTypes.join(' → ')}`);
             resolve(lastContent);
+          } else {
+            console.log(`⏸ status=IDLE but still blocked on uri="${stillBlocking}" (autoApproving=${autoApproving}) — keeping connection open`);
           }
         }
       },
       (err) => {
         clearTimeout(timeout);
-        console.log(`❌ streamAgentState error after ${updateCount} updates: ${err.message}`);
+        console.log(`❌ streamAgentState error after ${updateCount} updates (${Date.now() - tStart}ms): ${err.message}`);
+        console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ') || '(none)'}`);
         if (lastContent) resolve(lastContent);
         else reject(new Error(`Stream error: ${err.message}`));
       }
@@ -316,8 +550,12 @@ function waitForResponse(port: number, csrf: string, apiKey: string, cascadeId: 
 /**
  * Stream the AI response as chunks.
  * Auto-approves blocking NOTIFY_USER steps.
+ *
+ * IMPORTANT: subscribes to state updates FIRST, then calls `trigger()` to send
+ * the user message. The Antigravity executor only runs when an active subscriber
+ * is listening — sending before subscribing leaves the cascade stuck in IDLE.
  */
-async function* streamResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number): AsyncGenerator<StreamChunk> {
+async function* streamResponse(port: number, csrf: string, apiKey: string, cascadeId: string, model: string, maxWaitMs: number, trigger: () => Promise<void>): AsyncGenerator<StreamChunk> {
   type QueueItem = StreamChunk | null;
   const queue: QueueItem[] = [];
   let resolve: (() => void) | null = null;
@@ -337,13 +575,32 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
   let autoApproving = false;
   const approvedUris = new Set<string>();
 
+  // Diagnostics
+  const tStart = Date.now();
+  let tFirstUpdate = 0;
+  let tFirstContent = 0;
+  let tFirstDelta = 0;
+  let deltaCount = 0;
+  const seenStepTypes: string[] = [];
+  const stepTypeCount = new Map<string, number>();
+
   const timeout = setTimeout(() => {
     abort();
-    console.log(`⏱ streamResponse timeout after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars`);
+    console.log(`⏱ streamResponse TIMEOUT after ${maxWaitMs}ms — updates=${updateCount} lastContent=${lastContent.length}chars deltas=${deltaCount}`);
+    console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ') || '(none)'}`);
+    console.log(`   sequence: ${seenStepTypes.join(' → ')}`);
+    console.log(`   --- last ${recentUpdates.length} update bodies ---`);
+    for (const u of recentUpdates) console.log(`   ${u}`);
     push({ type: 'done', conversationId: cascadeId });
     push(null);
   }, maxWaitMs);
 
+  let lastStatus = '';
+  let firstUpdateDumped = false;
+  const shapeDiagnosticsSeen = new Set<string>();
+  // Keep ring buffer of last N raw update bodies for post-mortem on timeout/error.
+  const RECENT_BUF_SIZE = 6;
+  const recentUpdates: string[] = [];
   const abort = grpc.streamAgentState(
     port, csrf, cascadeId,
     (update) => {
@@ -352,10 +609,38 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
       const stepsUpdate = update?.mainTrajectoryUpdate?.stepsUpdate;
       const steps: any[] = stepsUpdate?.steps || [];
 
-      // Always log first update and status transitions so we can diagnose hangs
-      if (updateCount === 1 || status.includes('IDLE') || status.includes('ERROR')) {
+      // Always keep recent updates for timeout post-mortem
+      const updateStr = JSON.stringify(update);
+      recentUpdates.push(`#${updateCount} status=${status} ${updateStr.slice(0, 800)}`);
+      if (recentUpdates.length > RECENT_BUF_SIZE) recentUpdates.shift();
+
+      if (updateCount === 1) {
+        tFirstUpdate = Date.now();
+        console.log(`⏱ [stream] first update arrived after ${tFirstUpdate - tStart}ms`);
+      }
+      if (!firstUpdateDumped) {
+        firstUpdateDumped = true;
+        console.log(`🔎 [stream] first update keys=${Object.keys(update || {}).join(',')} body=${updateStr.slice(0, 1500)}`);
+      }
+
+      // Track step type sequence — log every NEW type
+      if (steps.length) {
         const last = steps[steps.length - 1];
-        console.log(`📡 stream #${updateCount} cascadeId=${cascadeId.slice(0,8)} status=${status} steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+        const t = last?.type || '?';
+        const prevLast = seenStepTypes[seenStepTypes.length - 1];
+        if (t !== prevLast) {
+          seenStepTypes.push(t);
+          console.log(`🔸 [stream] step #${steps.length} type=${t} (Δ${Date.now() - tStart}ms) hasPR=${!!last?.plannerResponse} keys=${Object.keys(last || {}).join(',')}`);
+        }
+        stepTypeCount.set(t, (stepTypeCount.get(t) || 0) + 1);
+      }
+
+      // Log EVERY status transition AND dump the full update body (so we can see error fields).
+      if (status !== lastStatus) {
+        const last = steps[steps.length - 1];
+        console.log(`📡 stream #${updateCount} status=${lastStatus || '∅'} → ${status} (Δ${Date.now() - tStart}ms) steps=${steps.length} lastStepType=${last?.type || '-'} hasPR=${!!last?.plannerResponse}`);
+        console.log(`   body=${updateStr.slice(0, 1500)}`);
+        lastStatus = status;
       }
       dbg(`stream update#${updateCount} status=${status} steps=${steps.length}`);
       if (DEBUG && steps.length) {
@@ -364,10 +649,21 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
       }
 
       if (steps.length) {
+        logStepShapeDiagnostics(steps, '🔬 [stream]', shapeDiagnosticsSeen);
+
         const newContent = extractContent(steps);
+        if (newContent && !tFirstContent) {
+          tFirstContent = Date.now();
+          console.log(`⏱ [stream] first content present after ${tFirstContent - tStart}ms (${newContent.length}chars)`);
+        }
         if (newContent.length > lastContent.length) {
           const delta = newContent.slice(lastContent.length);
           lastContent = newContent;
+          deltaCount++;
+          if (!tFirstDelta) {
+            tFirstDelta = Date.now();
+            console.log(`⏱ [stream] first delta emitted after ${tFirstDelta - tStart}ms (${delta.length}chars)`);
+          }
           push({ type: 'content_delta', text: delta, conversationId: cascadeId });
         }
 
@@ -387,24 +683,41 @@ async function* streamResponse(port: number, csrf: string, apiKey: string, casca
         }
       }
 
-      if (status === 'CASCADE_RUN_STATUS_IDLE' && lastContent && !autoApproving) {
+      if (lastContent && !autoApproving && (status === 'CASCADE_RUN_STATUS_IDLE' || hasRequestedInteraction(steps))) {
         const stillBlocking = steps.length > 0 ? getBlockingNotifyUri(steps) : null;
         if (stillBlocking === null) {
           clearTimeout(timeout);
           abort();
-          dbg(`stream resolved after ${updateCount} updates`);
+          const tEnd = Date.now();
+          console.log(`✅ [stream] DONE after ${tEnd - tStart}ms status=${status || '-'} donePlanner=${hasDonePlannerResponse(steps)} requestedInteraction=${hasRequestedInteraction(steps)} (firstUpdate=${tFirstUpdate - tStart}ms firstContent=${tFirstContent ? tFirstContent - tStart : -1}ms firstDelta=${tFirstDelta ? tFirstDelta - tStart : -1}ms updates=${updateCount} deltas=${deltaCount} steps=${steps.length})`);
+          console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ')}`);
+          console.log(`   sequence: ${seenStepTypes.join(' → ')}`);
           push({ type: 'done', conversationId: cascadeId });
           push(null);
+        } else {
+          console.log(`⏸ [stream] status=IDLE but blocked uri="${stillBlocking}" (autoApproving=${autoApproving})`);
         }
       }
     },
     (err) => {
       clearTimeout(timeout);
-      console.log(`❌ streamAgentState error after ${updateCount} updates: ${err.message}`);
+      console.log(`❌ [stream] streamAgentState error after ${updateCount} updates (${Date.now() - tStart}ms): ${err.message}`);
+      console.log(`   stepTypes: ${[...stepTypeCount.entries()].map(([t,n]) => `${t}×${n}`).join(', ') || '(none)'}`);
       push({ type: 'error', error: err.message });
       push(null);
     }
   );
+
+  // Subscription is now set up. Send the user message — this triggers the executor.
+  try {
+    await trigger();
+  } catch (err: any) {
+    clearTimeout(timeout);
+    abort();
+    console.log(`❌ [stream] trigger (sendMessage) failed: ${err.message}`);
+    yield { type: 'error', error: err.message };
+    return;
+  }
 
   while (true) {
     await waitForItem();
