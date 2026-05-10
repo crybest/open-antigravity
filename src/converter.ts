@@ -96,7 +96,11 @@ function buildPromptText(req: CompletionRequest): string {
 }
 
 /** Debug logging — set DEBUG=1 to enable. */
-const DEBUG = !!process.env.DEBUG;
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+const console = {
+  ...globalThis.console,
+  log: (...args: any[]) => { if (DEBUG) globalThis.console.log(...args); },
+};
 function dbg(...args: any[]) { if (DEBUG) console.log('[DBG]', ...args); }
 
 /**

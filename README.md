@@ -139,6 +139,8 @@ Antigravity language_server
 | `PORT` | `4000` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `MAX_BODY_SIZE` | `1048576` | 最大请求体大小，单位字节；默认 1MiB，适合普通 chat 文本请求 |
+| `DEBUG` | 未设置 | 设为 `1` 或 `true` 时输出请求、状态流等调试日志 |
+| `DEBUG_GRPC` | 未设置 | 设为 `1` 或 `true` 时输出 gRPC 请求/响应 body；可能包含 prompt 或响应内容 |
 
 ## 技术栈
 

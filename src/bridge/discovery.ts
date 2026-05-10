@@ -1,6 +1,8 @@
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+
 export interface LanguageServerInfo {
   pid: number;
   port: number;
@@ -181,7 +183,7 @@ export function discoverLanguageServers(): LanguageServerInfo[] {
     }
   } catch {}
 
-  if (servers.length !== _cachedServers.length || servers.some((s, i) => s.port !== _cachedServers[i]?.port)) {
+  if (DEBUG && (servers.length !== _cachedServers.length || servers.some((s, i) => s.port !== _cachedServers[i]?.port))) {
     console.log(`🔎 Discovered ${servers.length} server(s): ${servers.map(s => `port=${s.port} ws="${s.workspace ?? '<no-workspace>'}"`).join(' | ')}`);
   }
 

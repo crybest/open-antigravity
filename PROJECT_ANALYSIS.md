@@ -11,7 +11,7 @@
 1. 请求处理健壮性：已增加默认 1MiB 请求体大小限制与 400/413 错误返回；仍需补 request timeout 与 `Content-Type` 校验。
 2. 安全默认值：默认监听 `0.0.0.0`、无认证、CORS 全开放、自动批准/自动执行风险较高；若明确仅本机使用，优先级可降为 P1。
 3. Anthropic system array 兼容问题：底层支持数组格式，但路由层会丢弃。
-4. 日志脱敏：当前可能打印 Authorization、prompt、response、gRPC body 等敏感内容。
+4. 日志脱敏：已将请求、状态流、prompt/response、gRPC body 等详细日志改为默认关闭；需要 `DEBUG=1` / `DEBUG_GRPC=1` 才输出。
 5. 测试不足：有 smoke 测试，但缺少低成本单元测试与 CI。
 6. `converter.ts` 过大：核心状态机、流式/非流式逻辑、自动审批、诊断日志集中在一个文件。
 
@@ -29,6 +29,7 @@ npm audit --omit=dev
 - `npm run build` 通过。
 - 手动验证请求体超限返回 `413 payload_too_large`。
 - 手动验证 JSON 格式错误返回 `400 invalid_json`。
+- 手动验证 `DEBUG=0` 时 health 请求不会输出 access log、workspace 路径或 API key 前缀。
 - `npm audit --omit=dev` 显示 0 vulnerabilities。
 - 未执行 `npm run smoke`，因为它要求本地代理服务与 Antigravity 桌面应用已运行。
 
@@ -207,22 +208,19 @@ system,
 3. 抽出共享的 `handleStepUpdate()` 或 `CascadeStateTracker`。
 4. 保持外部 API 不变，先加单元测试再拆。
 
-### P1：大量调试日志默认开启，可能泄露内容和拖慢服务
+### P1：大量调试日志默认开启，可能泄露内容和拖慢服务（已处理）
 
-当前日志可能打印：
+当前已改为默认关闭详细调试日志：
 
-- Authorization / x-api-key。
-- gRPC request / response。
-- prompt / response 片段。
-- stream update body。
-- timeout 时的 recent update bodies。
+- 请求 access log、Anthropic body 摘要、count_tokens 摘要需要 `DEBUG=1` 才输出。
+- `converter.ts` 中状态流、step 诊断、prompt/response 长度、timeout recent update bodies 需要 `DEBUG=1` 才输出。
+- gRPC request / response body 需要 `DEBUG_GRPC=1` 才输出。
+- debug 请求头中 `Authorization` / `x-api-key` / `x-codeium-csrf-token` / `cookie` 会脱敏。
 
-建议：
+后续建议：
 
-1. 默认只打印简短 access log。
-2. 详细日志放到 `DEBUG=1`。
-3. 对敏感字段统一 redaction。
-4. 不要默认打印 prompt、response、metadata、headers。
+1. 后续如继续扩展日志，统一使用轻量 logger，避免直接 `console.log`。
+2. 可进一步把 startup 状态、warning、error 分成 `LOG_LEVEL`。
 
 ### P1：`statedb.ts` 使用 shell 拼接调用 sqlite3，可移植性和健壮性一般
 
@@ -378,7 +376,7 @@ system,
 ### 第四阶段：可维护性重构
 
 1. 给日志分级。
-2. 默认关闭 gRPC body dump。
+2. `[已完成]` 默认关闭 gRPC body dump。
 3. 抽出 cascade 初始化公共函数。
 4. 抽出 prompt 构造公共函数。
 5. 后续再拆状态追踪逻辑。

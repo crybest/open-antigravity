@@ -2,6 +2,7 @@ import https from 'https';
 import { IncomingMessage } from 'http';
 
 const agent = new https.Agent({ rejectUnauthorized: false });
+const DEBUG_GRPC = process.env.DEBUG_GRPC === '1' || process.env.DEBUG_GRPC === 'true';
 
 /**
  * Build a Connect streaming envelope: [flags:1][length:4 BE][payload]
@@ -39,7 +40,7 @@ export interface GrpcCallOptions {
   body: Record<string, any>;
 }
 
-/** Methods whose request/response should be dumped for debugging */
+/** Methods whose request/response can be dumped with DEBUG_GRPC=1. */
 const VERBOSE_METHODS = new Set(['StartCascade', 'SendUserCascadeMessage', 'AddTrackedWorkspace', 'UpdateConversationAnnotations']);
 
 function truncate(s: string, n = 2000): string {
@@ -52,7 +53,7 @@ function truncate(s: string, n = 2000): string {
 export function grpcCall(opts: GrpcCallOptions): Promise<any> {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(opts.body);
-    const verbose = VERBOSE_METHODS.has(opts.method);
+    const verbose = DEBUG_GRPC && VERBOSE_METHODS.has(opts.method);
     const t0 = Date.now();
     if (verbose) {
       console.log(`📤 ${opts.method} req=${truncate(payload)}`);

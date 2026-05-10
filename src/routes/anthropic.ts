@@ -7,6 +7,9 @@ import { IncomingMessage, ServerResponse } from 'http';
 import { complete, completeStream } from '../converter.js';
 import { v4 } from '../utils.js';
 
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+function debugLog(...args: any[]) { if (DEBUG) console.log(...args); }
+
 /**
  * POST /v1/messages
  */
@@ -27,7 +30,7 @@ export async function handleMessages(req: IncomingMessage, res: ServerResponse, 
   // Return an instant stub response instead of creating a full cascade.
   if (max_tokens != null && max_tokens <= 1) {
     const lastMsg = messages[messages.length - 1]?.content || '';
-    console.log(`⚡ Fast-path validation: max_tokens=${max_tokens}, msg="${String(lastMsg).slice(0, 20)}"`);
+    debugLog(`⚡ Fast-path validation: max_tokens=${max_tokens}, msgLen=${String(lastMsg).length}`);
     const stubResponse = {
       id: `msg_${v4()}`,
       type: 'message',

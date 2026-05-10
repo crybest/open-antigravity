@@ -22,6 +22,19 @@ const configuredMaxBodySize = parseInt(process.env.MAX_BODY_SIZE || '', 10);
 const MAX_BODY_SIZE = Number.isFinite(configuredMaxBodySize) && configuredMaxBodySize > 0
   ? configuredMaxBodySize
   : DEFAULT_MAX_BODY_SIZE;
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+
+function debugLog(...args: any[]) {
+  if (DEBUG) console.log(...args);
+}
+
+function formatDebugHeaders(headers: IncomingMessage['headers']): string {
+  const sensitive = new Set(['authorization', 'x-api-key', 'x-codeium-csrf-token', 'cookie']);
+  return Object.entries(headers)
+    .filter(([k]) => k.startsWith('x-') || k === 'anthropic-version' || k === 'content-type' || k === 'authorization')
+    .map(([k, v]) => `${k}=${sensitive.has(k) ? '<redacted>' : v}`)
+    .join(', ');
+}
 
 class HttpError extends Error {
   constructor(
@@ -87,7 +100,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   const url = rawUrl.split('?')[0];
 
   // Debug logging for all requests
-  console.log(`📥 ${req.method} ${rawUrl} [${Object.entries(req.headers).filter(([k]) => k.startsWith('x-') || k === 'anthropic-version' || k === 'content-type' || k === 'authorization').map(([k,v]) => `${k}=${v}`).join(', ')}]`);
+  debugLog(`📥 ${req.method} ${rawUrl} [${formatDebugHeaders(req.headers)}]`);
 
   try {
     // Health check
@@ -136,7 +149,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     // Anthropic: POST /v1/messages
     if (url === '/v1/messages' && req.method === 'POST') {
       const body = await parseBody(req);
-      console.log(`  ↳ model=${body.model} max_tokens=${body.max_tokens} stream=${body.stream} msgs=${body.messages?.length} tools=${body.tools?.length ?? 0} sysLen=${typeof body.system === 'string' ? body.system.length : 0}`);
+      debugLog(`  ↳ model=${body.model} max_tokens=${body.max_tokens} stream=${body.stream} msgs=${body.messages?.length} tools=${body.tools?.length ?? 0} sysLen=${typeof body.system === 'string' ? body.system.length : 0}`);
       await handleMessages(req, res, body);
       return;
     }
@@ -147,7 +160,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     if (url === '/v1/messages/count_tokens' && req.method === 'POST') {
       const body = await parseBody(req);
       const inputTokens = JSON.stringify(body.messages || []).length / 4; // rough estimate
-      console.log(`📊 count_tokens stub: model=${body.model}, estimated=${Math.ceil(inputTokens)}`);
+      debugLog(`📊 count_tokens stub: model=${body.model}, estimated=${Math.ceil(inputTokens)}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ input_tokens: Math.ceil(inputTokens) }));
       return;
@@ -202,12 +215,12 @@ server.listen(PORT, HOST, () => {
     console.log('⚠️  No Antigravity language_server found. Is Antigravity running?');
   } else {
     console.log(`✅ Found ${servers.length} server(s):`);
-    servers.forEach(s => console.log(`   port=${s.port}  workspace="${s.workspace ?? '<no-workspace>'}"`));
+    servers.forEach(s => debugLog(`   port=${s.port}  workspace="${s.workspace ?? '<no-workspace>'}"`));
   }
   if (!apiKey) {
     console.log('⚠️  No API key found in state.vscdb');
   } else {
-    console.log(`✅ API key loaded (${apiKey.slice(0, 8)}...)`);
+    console.log('✅ API key loaded');
   }
   console.log('');
 });
