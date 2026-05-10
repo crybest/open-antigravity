@@ -8,8 +8,8 @@
 
 但整体成熟度更接近“个人本地实验/调试工具”，距离安全、可维护、可发布的稳定代理服务还有明显优化空间。最值得优先处理的是：
 
-1. 安全默认值：默认监听 `0.0.0.0`、无认证、CORS 全开放、自动批准/自动执行风险较高。
-2. 请求处理健壮性：请求体没有大小限制，错误响应不够精确。
+1. 请求处理健壮性：已增加默认 1MiB 请求体大小限制与 400/413 错误返回；仍需补 request timeout 与 `Content-Type` 校验。
+2. 安全默认值：默认监听 `0.0.0.0`、无认证、CORS 全开放、自动批准/自动执行风险较高；若明确仅本机使用，优先级可降为 P1。
 3. Anthropic system array 兼容问题：底层支持数组格式，但路由层会丢弃。
 4. 日志脱敏：当前可能打印 Authorization、prompt、response、gRPC body 等敏感内容。
 5. 测试不足：有 smoke 测试，但缺少低成本单元测试与 CI。
@@ -27,6 +27,8 @@ npm audit --omit=dev
 结果：
 
 - `npm run build` 通过。
+- 手动验证请求体超限返回 `413 payload_too_large`。
+- 手动验证 JSON 格式错误返回 `400 invalid_json`。
 - `npm audit --omit=dev` 显示 0 vulnerabilities。
 - 未执行 `npm run smoke`，因为它要求本地代理服务与 Antigravity 桌面应用已运行。
 
@@ -124,9 +126,9 @@ open-antigravity
 
 ## 主要优化建议
 
-### P0：安全默认值风险较高
+### P1：安全默认值风险较高
 
-当前最重要的问题是安全边界过宽。
+如果服务面向局域网或公网，这是高风险问题；如果明确仅本机使用，风险主要来自默认配置不够收敛，因此降为 P1。
 
 主要风险：
 
@@ -149,22 +151,19 @@ open-antigravity
    - `AUTO_APPROVE_ARTIFACTS=1`
    - `AUTO_EXECUTION=eager|off`
 
-### P0：请求体没有大小限制
+### P0：请求体处理健壮性（大小限制已处理）
 
-当前 body parser 直接拼接字符串，没有限制。问题包括：
+当前已在 `src/index.ts` 增加 `MAX_BODY_SIZE`，默认 `1048576` 字节（1MiB），适合普通 chat 文本请求。超限请求会返回 `413 payload_too_large`，JSON 格式错误会返回 `400 invalid_json`。
 
-- 大请求会占用大量内存。
+剩余问题包括：
+
 - 没有 request timeout。
-- JSON 解析错误最终可能被当作 500，而不是 400。
 - 没有 `Content-Type` 校验。
 
-建议：
+后续建议：
 
-1. 增加最大 body，例如默认 `1MB`。
-2. 超限返回 `413 Payload Too Large`。
-3. JSON 错误返回 `400 Bad Request`。
-4. 非 JSON 返回 `415 Unsupported Media Type`。
-5. 对 HTTP server 设置 `requestTimeout` / `headersTimeout`。
+1. 非 JSON 返回 `415 Unsupported Media Type`。
+2. 对 HTTP server 设置 `requestTimeout` / `headersTimeout`。
 
 ### P1：Anthropic `system` 数组格式被路由层丢掉
 
@@ -354,21 +353,21 @@ system,
 
 ## 优先级执行路线
 
-### 第一阶段：安全与防滥用
+### 第一阶段：请求处理健壮性
+
+1. `[已完成]` `parseBody` 加 size limit，默认 `MAX_BODY_SIZE=1048576`。
+2. `[已完成]` invalid JSON 返回 400。
+3. `[已完成]` body 超限返回 413。
+4. `[待处理]` server 设置 timeout。
+5. `[待处理]` 非支持 method / content-type 返回更清楚的错误。
+
+### 第二阶段：安全默认值收敛
 
 1. 默认 `HOST=127.0.0.1`。
 2. 增加可选强制认证 `PROXY_API_KEY`。
 3. 移除/脱敏 Authorization、x-api-key、apiKey、csrf 日志。
 4. 关闭默认 debug endpoint。
 5. 自动执行/自动批准改成 opt-in。
-
-### 第二阶段：请求处理健壮性
-
-1. `parseBody` 加 size limit。
-2. invalid JSON 返回 400。
-3. body 超限返回 413。
-4. server 设置 timeout。
-5. 非支持 method / content-type 返回更清楚的错误。
 
 ### 第三阶段：兼容性修复
 
@@ -433,10 +432,10 @@ system,
 
 下一步最建议直接做一轮“小而关键”的代码优化：
 
-1. 默认 localhost。
-2. 可选 API key 鉴权。
-3. 日志脱敏。
-4. body size limit。
+1. request timeout / `Content-Type` 校验。
+2. 默认 localhost。
+3. 可选 API key 鉴权。
+4. 日志脱敏。
 5. 修复 Anthropic system array。
 
 这些改动范围小，但能显著提升安全性、健壮性和实际可用性。

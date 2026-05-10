@@ -17,16 +17,48 @@ import { getModelConfigs } from './bridge/grpc.js';
 
 const PORT = parseInt(process.env.PORT || '4000');
 const HOST = process.env.HOST || '0.0.0.0';
+const DEFAULT_MAX_BODY_SIZE = 1024 * 1024;
+const configuredMaxBodySize = parseInt(process.env.MAX_BODY_SIZE || '', 10);
+const MAX_BODY_SIZE = Number.isFinite(configuredMaxBodySize) && configuredMaxBodySize > 0
+  ? configuredMaxBodySize
+  : DEFAULT_MAX_BODY_SIZE;
+
+class HttpError extends Error {
+  constructor(
+    public statusCode: number,
+    public type: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 // --- Request body parser ---
 function parseBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
+    const contentLength = Number(req.headers['content-length'] || 0);
+    if (contentLength > MAX_BODY_SIZE) {
+      reject(new HttpError(413, 'payload_too_large', `Request body exceeds ${MAX_BODY_SIZE} bytes`));
+      return;
+    }
+
     let data = '';
-    req.on('data', chunk => { data += chunk; });
+    let size = 0;
+    let tooLarge = false;
+    req.on('data', chunk => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        tooLarge = true;
+        reject(new HttpError(413, 'payload_too_large', `Request body exceeds ${MAX_BODY_SIZE} bytes`));
+        return;
+      }
+      data += chunk;
+    });
     req.on('end', () => {
       if (!data) return resolve({});
       try { resolve(JSON.parse(data)); }
-      catch { reject(new Error('Invalid JSON')); }
+      catch { reject(new HttpError(400, 'invalid_json', 'Invalid JSON')); }
     });
     req.on('error', reject);
   });
@@ -139,9 +171,9 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   } catch (err: any) {
     console.error('❌ Request error:', err.message);
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
     }
-    res.end(JSON.stringify({ error: { message: err.message, type: 'server_error' } }));
+    res.end(JSON.stringify({ error: { message: err.message, type: err.type || 'server_error' } }));
   }
 });
 
