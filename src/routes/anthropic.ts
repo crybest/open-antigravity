@@ -65,7 +65,7 @@ export async function handleMessages(req: IncomingMessage, res: ServerResponse, 
   const request = {
     messages,
     model,
-    system: typeof system === 'string' ? system : undefined,
+    system,
     workspace,
     conversationId,
     maxWaitMs: 120_000,

@@ -50,6 +50,51 @@ function extractSystemText(system: any): string | undefined {
   return undefined;
 }
 
+function formatMessageForPrompt(message: { role: string; content: unknown }): string {
+  const text = extractText(message.content).trim();
+  if (!text) return '';
+
+  const label = message.role === 'assistant'
+    ? 'Assistant'
+    : message.role === 'user'
+      ? 'User'
+      : message.role || 'Message';
+  return `${label}: ${text}`;
+}
+
+function buildPromptText(req: CompletionRequest): string {
+  const conversationMessages = req.messages.filter(m => m.role !== 'system');
+  const lastUserIndex = conversationMessages.map(m => m.role).lastIndexOf('user');
+  const lastUserMsg = lastUserIndex >= 0 ? conversationMessages[lastUserIndex] : undefined;
+  if (!lastUserMsg) throw new Error('No user message found in messages array');
+
+  // OpenAI/Anthropic HTTP APIs are stateless: normal chat clients send the full
+  // transcript on every request and do not know about our private cascade ID.
+  // If the caller does provide x-conversation-id, Antigravity already has the
+  // prior turns, so only send the latest user message to avoid duplicating them.
+  const currentUserText = extractText(lastUserMsg.content).trim();
+  const promptParts: string[] = [];
+
+  const sysText = extractSystemText(req.system);
+  if (sysText) {
+    promptParts.push(`<system_instructions>\n${sysText}\n</system_instructions>`);
+  }
+
+  if (!req.conversationId) {
+    const historyText = conversationMessages
+      .slice(0, lastUserIndex)
+      .map(formatMessageForPrompt)
+      .filter(Boolean)
+      .join('\n\n');
+    if (historyText) {
+      promptParts.push(`<conversation_history>\n${historyText}\n</conversation_history>`);
+    }
+  }
+
+  promptParts.push(`<current_user_message>\n${currentUserText}\n</current_user_message>`);
+  return promptParts.join('\n\n');
+}
+
 /** Debug logging — set DEBUG=1 to enable. */
 const DEBUG = !!process.env.DEBUG;
 function dbg(...args: any[]) { if (DEBUG) console.log('[DBG]', ...args); }
@@ -189,9 +234,9 @@ function logStepShapeDiagnostics(steps: any[], prefix: string, seen: Set<string>
 }
 
 export interface CompletionRequest {
-  messages: Array<{ role: string; content: string }>;
+  messages: Array<{ role: string; content: unknown }>;
   model?: string;
-  system?: string;
+  system?: unknown;
   workspace?: string;       // file:///path or auto-detect
   conversationId?: string;  // reuse existing conversation
   maxWaitMs?: number;        // timeout (default 120s)
@@ -302,16 +347,7 @@ export async function complete(req: CompletionRequest): Promise<CompletionResult
   const maxWait = req.maxWaitMs || 120_000;
   console.log(`🧠 complete: model=${req.model} → ${internalModel} maxWait=${maxWait}ms`);
 
-  // Build the message text (prepend system prompt if present)
-  const userMessages = req.messages.filter(m => m.role === 'user' || m.role === 'assistant');
-  const lastUserMsg = userMessages.filter(m => m.role === 'user').pop();
-  if (!lastUserMsg) throw new Error('No user message found in messages array');
-
-  let promptText = extractText(lastUserMsg.content);
-  if (req.system) {
-    const sysText = extractSystemText(req.system);
-    if (sysText) promptText = `[System: ${sysText}]\n\n${promptText}`;
-  }
+  const promptText = buildPromptText(req);
 
   // Create or reuse conversation
   let cascadeId = req.conversationId;
@@ -372,17 +408,12 @@ export async function* completeStream(req: CompletionRequest): AsyncGenerator<St
   const internalModel = resolveModelId(req.model);
   const maxWait = req.maxWaitMs || 120_000;
 
-  const userMessages = req.messages.filter(m => m.role === 'user');
-  const lastUserMsg = userMessages.pop();
-  if (!lastUserMsg) {
+  let promptText = '';
+  try {
+    promptText = buildPromptText(req);
+  } catch (err: any) {
     yield { type: 'error', error: 'No user message found' };
     return;
-  }
-
-  let promptText = extractText(lastUserMsg.content);
-  if (req.system) {
-    const sysText = extractSystemText(req.system);
-    if (sysText) promptText = `[System: ${sysText}]\n\n${promptText}`;
   }
 
   // Create or reuse conversation
